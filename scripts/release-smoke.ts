@@ -3,16 +3,21 @@
 // Usage:
 //   tsx scripts/release-smoke.ts api
 //     env: SUPABASE_URL, SUPABASE_ANON_KEY (public values: vars.VITE_SUPABASE_URL / vars.VITE_SUPABASE_ANON_KEY).
+//     SUPABASE_URL must be exactly https://<PRODUCTION_SUPABASE_PROJECT_REF>.supabase.co (both modes), checked before
+//     any request.
 //     Supabase reachable, stock_status readable as anon, the storefront queries of the new frontend, the queries of the
 //     PREVIOUS frontend (main 741d478: stock_quantity embed, filter, select('*')) still work — fail-closed, an Expand
 //     release must not break them —, the stock RPC exists and is refused to anon, every Edge Function deployed by
 //     supabase-deploy.yml answers, checkout requires Telegram.
-//   tsx scripts/release-smoke.ts web <app-url>... [--slug <shop>]
-//     env: SUPABASE_URL. Every URL: app shell on the public pages, JS bundle downloadable, new stock_status contract,
-//     expected Supabase project.
+//   tsx scripts/release-smoke.ts web --deployment-url <url> --production-url <url> --pages-project <name> [--slug <shop>]
+//     env: SUPABASE_URL. Both URLs are required and validated before any request (an empty value fails, it is never
+//     skipped): the deployment URL must be https://<id>.<project>.pages.dev, the production URL a bare https origin
+//     (on pages.dev exactly https://<project>.pages.dev). Each URL: app shell on the public pages, JS bundle
+//     downloadable, new stock_status contract, expected Supabase project.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deployedFunctions, REPO_ROOT } from './lib/edge-functions.ts';
+import { assertSupabaseProjectUrl, PRODUCTION_SUPABASE_PROJECT_REF } from './lib/release.ts';
 import {
   assertAppShell,
   assertBundleContract,
@@ -24,15 +29,16 @@ import {
   assertStorefrontQuery,
   assertSupabaseReachable,
   assetScripts,
-  DEFAULT_SMOKE_SLUG,
   LEGACY_FRONTEND_QUERIES,
+  parseWebArgs,
   PUBLIC_PAGES,
   STOCK_RPC,
   STOREFRONT_PRODUCT_COLUMNS,
+  WEB_USAGE,
   type HttpResult,
 } from './lib/release-smoke.ts';
 
-const USAGE = 'Usage: release-smoke.ts api | web <app-url>... [--slug <shop>]';
+const USAGE = `Usage: release-smoke.ts api | ${WEB_USAGE.replace('Usage: release-smoke.ts ', '')}`;
 const MAX_CHUNKS = 120;
 
 function env(name: string): string {
@@ -48,8 +54,11 @@ async function http(url: string, init: RequestInit = {}): Promise<HttpResult> {
 
 const ok = (m: string) => console.log(`OK  ${m}`);
 
+/** SUPABASE_URL must be exactly the approved production project — checked before any request is sent. */
+const supabaseOrigin = () => assertSupabaseProjectUrl(process.env.SUPABASE_URL, PRODUCTION_SUPABASE_PROJECT_REF);
+
 async function smokeApi(): Promise<void> {
-  const base = env('SUPABASE_URL').replace(/\/$/, '');
+  const base = supabaseOrigin();
   const key = env('SUPABASE_ANON_KEY');
   const headers = { apikey: key };
   const rest = (path: string) => http(`${base}/rest/v1/${path}`, { headers });
@@ -97,7 +106,7 @@ async function smokeApi(): Promise<void> {
 }
 
 async function smokeWeb(urls: string[], slug: string): Promise<void> {
-  const supabaseUrl = env('SUPABASE_URL');
+  const supabaseUrl = supabaseOrigin();
   for (const raw of urls) {
     const base = new URL(raw).origin;
     let scripts: string[] = [];
@@ -127,11 +136,9 @@ const [command, ...rest] = process.argv.slice(2);
 try {
   if (command === 'api' && rest.length === 0) await smokeApi();
   else if (command === 'web') {
-    const slugAt = rest.indexOf('--slug');
-    const slug = slugAt >= 0 ? rest[slugAt + 1] : DEFAULT_SMOKE_SLUG;
-    const urls = rest.filter((_, i) => slugAt < 0 || (i !== slugAt && i !== slugAt + 1)).filter((u) => u.trim() !== '');
-    if (!slug || !/^[a-z0-9-]+$/.test(slug) || urls.length === 0) throw new Error(USAGE);
-    await smokeWeb(urls, slug);
+    // Every target is validated before any request; an empty or missing one stops the check instead of being dropped.
+    const { deploymentUrl, productionUrl, slug } = parseWebArgs(rest);
+    await smokeWeb([deploymentUrl, productionUrl], slug);
   } else throw new Error(USAGE);
 } catch (err) {
   console.error(err instanceof Error ? err.message : err);
